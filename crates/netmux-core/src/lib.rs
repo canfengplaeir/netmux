@@ -6,17 +6,21 @@
 //! frontend (`netmux-app`) or any other driver.
 
 pub mod aggregator;
+pub mod egress;
 pub mod error;
 pub mod interface;
 pub mod logging;
+pub mod nat;
 pub mod packet;
 pub mod policy;
 pub mod stats;
 pub mod tun;
 
 pub use aggregator::{Aggregator, ForwardDecision, Mode, PcapGenerator};
+pub use egress::{RawCapture, RawEgress};
 pub use error::{NetmuxError, Result};
 pub use interface::{Interface, InterfaceKind};
+pub use nat::{NatTable, Session};
 pub use policy::{
     AggregatorConfig, BalanceAlgorithm, CandidateIface, InterfacePolicy, Strategy,
 };

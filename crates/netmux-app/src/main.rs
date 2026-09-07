@@ -6,14 +6,18 @@
 //!   * `Tunnelling` mode when launched with `--tun` (requires root / CAP_NET_ADMIN)
 //!     to create the `netmux0` TUN device and forward real traffic.
 
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::*;
 
 use netmux_core::{
-    aggregator::PcapGenerator, policy::Strategy, tun, Aggregator, AggregatorConfig, BalanceAlgorithm,
-    InterfaceKind, Mode, NetmuxError,
+    aggregator::PcapGenerator, packet, policy::Strategy, tun, Aggregator, AggregatorConfig,
+    BalanceAlgorithm, InterfaceKind, Mode, NatTable, NetmuxError, RawCapture, RawEgress,
 };
 
 // ---------------------------------------------------------------------------
@@ -126,17 +130,20 @@ impl ThemeMode {
 // ---------------------------------------------------------------------------
 
 struct NetMuxApp {
-    aggregator: Aggregator,
+    /// Aggregation engine (shared with the data-plane thread).
+    aggregator: Arc<Mutex<Aggregator>>,
     generator: PcapGenerator,
-    /// Live TUN device in real (non-simulation) mode.
-    tun: Option<tun::Tun>,
+    /// Userspace NAT session table (shared with the data-plane threads).
+    nat: Arc<Mutex<NatTable>>,
+    /// Outbound packets / bytes forwarded (updated by the data plane).
+    tx_packets: Arc<AtomicU64>,
+    tx_bytes: Arc<AtomicU64>,
+    /// Packets injected back into the TUN by the return path.
+    nat_rx_packets: Arc<AtomicU64>,
     /// Named tab that is currently active.
     tab: Tab,
     /// Tunnel error surfaced in banner when real mode is unavailable.
     banner: Option<String>,
-    /// Bytes forwarded per nds (tracked for the summary line).
-    forwarded_packets: u64,
-    total_speed: f64,
     /// Last time a tunnelling-mode summary was logged.
     last_summary: std::time::Instant,
     /// User-selected theme mode (dark / light / follow system).
@@ -177,7 +184,7 @@ impl NetMuxApp {
                     if let Err(e) = tun::set_up(&t.name) {
                         tracing::warn!("ip link set {0} up: {e}", t.name);
                     }
-                    (Mode::Tunnelling, None, Some(t))
+                    (Mode::Tunnelling, None, Some(Arc::new(t)))
                 }
                 Err(NetmuxError::Permission(msg)) => (Mode::Simulation, Some(msg), None),
                 Err(e) => (Mode::Simulation, Some(e.to_string()), None),
@@ -191,67 +198,132 @@ impl NetMuxApp {
         };
 
         let mut app = NetMuxApp {
-            aggregator: Aggregator::new(config, mode).expect("valid config"),
+            aggregator: Arc::new(Mutex::new(
+                Aggregator::new(config, mode).expect("valid config"),
+            )),
             generator: PcapGenerator::default(),
-            tun,
+            nat: Arc::new(Mutex::new(NatTable::new())),
+            tx_packets: Arc::new(AtomicU64::new(0)),
+            tx_bytes: Arc::new(AtomicU64::new(0)),
+            nat_rx_packets: Arc::new(AtomicU64::new(0)),
             tab: Tab::Dashboard,
             banner,
-            forwarded_packets: 0,
-            total_speed: 0.0,
             last_summary: std::time::Instant::now(),
             theme_mode: ThemeMode::System,
             active_theme: Theme::dark(),
         };
-        app.aggregator.refresh_candidates();
+        {
+            let mut agg = app.aggregator.lock().expect("aggregator lock");
+            agg.refresh_candidates();
+        }
+        // Real mode: open raw sockets and start the data-plane threads
+        // (independent of the window's lifetime).
+        if mode == Mode::Tunnelling {
+            app.start_data_plane(tun.expect("tun in tunnelling mode"));
+        }
         app
     }
 
-    /// Advance the aggregator: synthetic packets (simulation) or real packets
-    /// drained from the TUN device (tunnelling).
+    /// Build egress/capture sockets for every schedulable physical interface
+    /// and spawn the data-plane thread (TUN drain + NAT egress) plus one
+    /// return-path thread per interface.
+    fn start_data_plane(&mut self, tun: Arc<tun::Tun>) {
+        let ips = if_addrs::get_if_addrs().unwrap_or_default();
+        let mut ipv4 = HashMap::new();
+        for ifa in &ips {
+            if let std::net::IpAddr::V4(v4) = ifa.ip() {
+                ipv4.insert(ifa.name.clone(), v4);
+            }
+        }
+
+        let candidates = {
+            let agg = self.aggregator.lock().expect("aggregator lock");
+            agg.candidates()
+        };
+        let mut egress = HashMap::new();
+        let mut iface_ips = HashMap::new();
+
+        for c in candidates {
+            if !c.policy.enabled || !c.healthy {
+                continue;
+            }
+            let Some(ip) = ipv4.get(&c.name).copied() else {
+                tracing::warn!("no IPv4 for {}, skipping egress", c.name);
+                continue;
+            };
+            match RawEgress::open(&c.name) {
+                Ok(sock) => {
+                    iface_ips.insert(c.name.clone(), ip);
+                    egress.insert(c.name.clone(), sock);
+                }
+                Err(e) => {
+                    tracing::warn!("RawEgress {}: {e}", c.name);
+                    continue;
+                }
+            }
+            match RawCapture::open(&c.name) {
+                Ok(cap) => {
+                    let tun = tun.clone();
+                    let nat = self.nat.clone();
+                    let rx = self.nat_rx_packets.clone();
+                    let ifname = c.name.clone();
+                    std::thread::spawn(move || capture_loop(&cap, &ifname, &tun, &nat, &rx));
+                }
+                Err(e) => tracing::warn!("RawCapture {}: {e}", c.name),
+            }
+        }
+
+        // Main data-plane thread: drain the TUN and egress NAT'd packets.
+        let egress_count = egress.len();
+        {
+            let nat = self.nat.clone();
+            let aggregator = self.aggregator.clone();
+            let tx_pkts = self.tx_packets.clone();
+            let tx_bytes = self.tx_bytes.clone();
+            std::thread::spawn(move || {
+                egress_loop(&tun, &nat, &aggregator, &egress, &iface_ips, &tx_pkts, &tx_bytes);
+            });
+        }
+
+        tracing::info!(
+            "data plane ready: {} egress interfaces, {} capture threads",
+            egress_count,
+            egress_count,
+        );
+    }
+
+    /// Advance the aggregator: synthetic packets (simulation) or stats refresh
+    /// (tunnelling — the actual forwarding runs on the data-plane thread).
     fn tick(&mut self) {
-        if self.aggregator.mode == Mode::Simulation {
+        let mut agg = self.aggregator.lock().expect("aggregator lock");
+        if agg.mode == Mode::Simulation {
             // Ensure we always have schedulable links for the demo.
-            if self.aggregator.candidates().is_empty() {
-                self.aggregator.inject_sim_candidates(&[
+            if agg.candidates().is_empty() {
+                agg.inject_sim_candidates(&[
                     ("eth0 (模拟)", InterfaceKind::Ethernet, 30, 3),
                     ("wlan0 (模拟)", InterfaceKind::Wifi, 20, 2),
                     ("wwan0 (模拟)", InterfaceKind::Cellular, 25, 1),
                 ]);
             }
-            let dt = self.aggregator.config.health_check_interval_secs.max(1) as f64 * 0.016;
+            let dt = agg.config.health_check_interval_secs.max(1) as f64 * 0.016;
             let n = self.generator.per_tick(Duration::from_secs_f64(dt));
             for _ in 0..n.min(2000) {
-                let pkt = self.generator.next_packet(96 + (self.forwarded_packets % 5) as usize * 64);
-                if let Some(d) = self.aggregator.route(&pkt) {
+                let pkt = self.generator.next_packet(96 + (self.tx_packets.load(Ordering::Relaxed) % 5) as usize * 64);
+                if let Some(d) = agg.route(&pkt) {
                     if d.interface.is_some() {
-                        self.forwarded_packets += 1;
+                        self.tx_packets.fetch_add(1, Ordering::Relaxed);
                         // accumulate a guessed throughput: each simulated packet ≈ 150 B
-                        self.total_speed += 150.0;
+                        self.tx_bytes.fetch_add(150, Ordering::Relaxed);
                     }
                 } else {
                     break;
                 }
             }
-        } else if let Some(tun) = &self.tun {
-            // Real mode: drain the TUN device and schedule every packet.
-            let mut buf = [0u8; tun::MAX_PACKET];
-            loop {
-                match tun.read(&mut buf) {
-                    Ok(0) | Err(_) => break, // EAGAIN / EOF / error — nothing more now
-                    Ok(n) => {
-                        if let Some(d) = self.aggregator.route(&buf[..n]) {
-                            if d.interface.is_some() {
-                                self.forwarded_packets += 1;
-                                self.total_speed += n as f64;
-                            }
-                        }
-                    }
-                }
-            }
-            self.aggregator.tick();
+        } else {
+            agg.tick();
             if self.last_summary.elapsed() >= std::time::Duration::from_secs(10) {
                 let mut per_iface: std::collections::BTreeMap<&str, usize> = Default::default();
-                for iface in self.aggregator.flow_table.values() {
+                for iface in agg.flow_table.values() {
                     *per_iface.entry(iface).or_insert(0) += 1;
                 }
                 let dist = per_iface
@@ -259,11 +331,15 @@ impl NetMuxApp {
                     .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let sessions = self.nat.lock().map(|n| n.sessions()).unwrap_or(0);
+                let tx = self.tx_packets.load(Ordering::Relaxed);
+                let rx = self.nat_rx_packets.load(Ordering::Relaxed);
                 tracing::info!(
-                    "tun summary: forwarded={} packets ({:.1} KiB), active_flows={}, distribution: {}",
-                    self.forwarded_packets,
-                    self.total_speed / 1024.0,
-                    self.aggregator.flow_table.len(),
+                    "tun summary: tx={} packets ({:.1} KiB), rx={} packets, sessions={}, distribution: {}",
+                    tx,
+                    self.tx_bytes.load(Ordering::Relaxed) as f64 / 1024.0,
+                    rx,
+                    sessions,
                     dist,
                 );
                 self.last_summary = std::time::Instant::now();
@@ -272,7 +348,8 @@ impl NetMuxApp {
     }
 
     fn toggle_enabled(&mut self) {
-        self.aggregator.config.enabled = !self.aggregator.config.enabled;
+        let mut agg = self.aggregator.lock().expect("aggregator lock");
+        agg.config.enabled = !agg.config.enabled;
     }
 
     fn cycle_theme(&mut self) {
@@ -280,16 +357,19 @@ impl NetMuxApp {
     }
 
     fn set_strategy(&mut self, s: Strategy) {
-        self.aggregator.config.strategy = s;
+        let mut agg = self.aggregator.lock().expect("aggregator lock");
+        agg.config.strategy = s;
     }
 
     fn set_algorithm(&mut self, a: BalanceAlgorithm) {
-        self.aggregator.config.algorithm = a;
+        let mut agg = self.aggregator.lock().expect("aggregator lock");
+        agg.config.algorithm = a;
     }
 
     fn iface_action(&mut self, action: IfaceAction) {
         use netmux_core::policy::InterfacePolicy;
-        let cfg = &mut self.aggregator.config;
+        let mut agg = self.aggregator.lock().expect("aggregator lock");
+        let cfg = &mut agg.config;
         match action {
             IfaceAction::Enable(name, enable) => {
                 let p = cfg
@@ -319,6 +399,125 @@ impl NetMuxApp {
 // ---------------------------------------------------------------------------
 // Rendering helpers
 // ---------------------------------------------------------------------------
+
+/// Per-interface return-path thread: capture inbound packets, reverse-NAT them
+/// and inject them back into the TUN so the client sees the reply.
+fn capture_loop(
+    cap: &RawCapture,
+    ifname: &str,
+    tun: &Arc<tun::Tun>,
+    nat: &Arc<Mutex<NatTable>>,
+    rx: &Arc<AtomicU64>,
+) {
+    tracing::info!("capture thread started on {ifname}");
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = match cap.recv(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("capture {ifname} recv: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+        };
+        if n < 20 || buf[0] >> 4 != 4 {
+            continue;
+        }
+        let Some(flow) = packet::parse(&buf[..n]) else {
+            continue;
+        };
+        let (Ok(src_ip), Ok(dst_ip)) = (
+            flow.src.parse::<Ipv4Addr>(),
+            flow.dst.parse::<Ipv4Addr>(),
+        ) else {
+            continue;
+        };
+        let session = {
+            let table = nat.lock().expect("nat lock");
+            table.lookup_return(flow.proto, src_ip, flow.sport, dst_ip, flow.dport)
+        };
+        let Some(session) = session else {
+            continue;
+        };
+        // Rewrite dst to the client's TUN address; the port already matches.
+        if !packet::rewrite_ipv4_dest(&mut buf[..n], session.client_ip) {
+            continue;
+        }
+        if let Err(e) = tun.write(&buf[..n]) {
+            tracing::debug!("tun write: {e}");
+        } else {
+            rx.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Main data-plane thread: drain the TUN device, NAT every packet to the
+/// chosen interface's address and send it out the raw egress socket.
+/// Runs for the lifetime of the process, independent of the window.
+fn egress_loop(
+    tun: &Arc<tun::Tun>,
+    nat: &Arc<Mutex<NatTable>>,
+    aggregator: &Arc<Mutex<Aggregator>>,
+    egress: &HashMap<String, RawEgress>,
+    iface_ips: &HashMap<String, Ipv4Addr>,
+    tx_pkts: &Arc<AtomicU64>,
+    tx_bytes: &Arc<AtomicU64>,
+) {
+    tracing::info!("data plane: TUN drain thread started");
+    let mut buf = [0u8; tun::MAX_PACKET];
+    loop {
+        let n = match tun.read(&mut buf) {
+            Ok(0) | Err(_) => {
+                // No packet right now; yield briefly.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            Ok(n) => n,
+        };
+        let Some(flow) = packet::parse(&buf[..n]) else {
+            continue;
+        };
+        // Pick the egress interface per the current policy.
+        let iface = {
+            let mut agg = aggregator.lock().expect("aggregator lock");
+            agg.route(&buf[..n]).and_then(|d| d.interface)
+        };
+        let Some(iface) = iface else {
+            continue;
+        };
+        let Some(egress_ip) = iface_ips.get(&iface).copied() else {
+            continue;
+        };
+        let Some(sock) = egress.get(&iface) else {
+            continue;
+        };
+        let Ok(dst) = flow.dst.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        // Register the NAT session (port-preserving).
+        let _session = {
+            let mut table = nat.lock().expect("nat lock");
+            table.register(&flow, &iface, egress_ip)
+        };
+        let Some(_session) = _session else {
+            continue;
+        };
+        // Rewrite src to the egress IP, fix checksums, then send.
+        let mut out = buf[..n].to_vec();
+        if !packet::rewrite_ipv4_source(&mut out, egress_ip) {
+            continue;
+        }
+        match sock.send(&out, dst) {
+            Ok(_) => {
+                tx_pkts.fetch_add(1, Ordering::Relaxed);
+                tx_bytes.fetch_add(out.len() as u64, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::debug!("egress {iface} send: {e}");
+            }
+        }
+    }
+}
 
 fn kind_label(k: InterfaceKind) -> &'static str {
     match k {
@@ -503,9 +702,11 @@ impl Render for NetMuxApp {
         // horizontal nav row to keep the layout usable on small windows.
         let narrow = window.bounds().size.width < px(720.0);
 
-        let enabled = self.aggregator.config.enabled;
-        let mode_label = self.aggregator.mode.label();
-        let candidates = self.aggregator.candidates().clone();
+        let (enabled, mode, candidates) = {
+            let agg = self.aggregator.lock().expect("aggregator lock");
+            (agg.config.enabled, agg.mode, agg.candidates())
+        };
+        let mode_label = mode.label();
         let max_speed = candidates
             .iter()
             .map(|c| c.tx_bps + c.rx_bps)
@@ -568,7 +769,7 @@ impl Render for NetMuxApp {
                             } else {
                                 div().into_any_element()
                             })
-                            .child(if enabled && self.aggregator.mode == Mode::Simulation {
+                            .child(if enabled && mode == Mode::Simulation {
                                 notice_box(&t, "模拟演示模式：展示负载均衡/故障转移调度。以 CAP_NET_ADMIN 运行并加 --tun 可启用真实 TUN 聚合。")
                             } else {
                                 div()
@@ -728,10 +929,17 @@ impl NetMuxApp {
                     .flex_wrap()
                     .child(entrance(kpi(&t, "已启用接口", format!("{used}/{healthy}")), "kpi-1"))
                     .child(entrance(
-                        kpi(&t, "聚合带宽(估算)", netmux_core::stats::fmt_bps(self.total_speed)),
+                        kpi(
+                            &t,
+                            "聚合带宽(估算)",
+                            netmux_core::stats::fmt_bps(self.tx_bytes.load(Ordering::Relaxed) as f64),
+                        ),
                         "kpi-2",
                     ))
-                    .child(entrance(kpi(&t, "转发包数", format!("{}", self.forwarded_packets)), "kpi-3"))
+                    .child(entrance(
+                        kpi(&t, "转发包数", format!("{}", self.tx_packets.load(Ordering::Relaxed))),
+                        "kpi-3",
+                    ))
                     .child(entrance(kpi(&t, "当前负载", format!("{:.1} Mbps", total_cap / 1e6)), "kpi-4")),
             )
             .child(div().text_sm().text_color(t.text_muted).child("负载均衡示意"))
@@ -879,8 +1087,10 @@ impl NetMuxApp {
     }
 
     fn render_policy(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let strategy = self.aggregator.config.strategy;
-        let algo = self.aggregator.config.algorithm;
+        let (strategy, algo) = {
+            let agg = self.aggregator.lock().expect("aggregator lock");
+            (agg.config.strategy, agg.config.algorithm)
+        };
         let mut s = div().flex().flex_col().gap_3();
 
         s = s.child(div().text_sm().text_color(t.text_muted).child("聚合策略"));
@@ -963,7 +1173,10 @@ impl NetMuxApp {
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().text_sm().child(format!("当前活跃流记录: {} 条", self.aggregator.flow_table.len()))),
+                .child(div().text_sm().child(format!(
+                    "当前活跃流记录: {} 条",
+                    self.aggregator.lock().expect("aggregator lock").flow_table.len()
+                ))),
             "stat-flows",
         ))
     }

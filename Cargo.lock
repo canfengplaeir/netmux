@@ -3326,6 +3326,7 @@ dependencies = [
  "chrono",
  "gpui-platform-gpui-unofficial",
  "gpui-unofficial",
+ "if-addrs",
  "log",
  "netmux-core",
  "serde",

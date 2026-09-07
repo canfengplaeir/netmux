@@ -16,13 +16,14 @@ NetMux 是一款基于 **Rust** 与 **GPUI**（GPU 加速 UI 框架）开发的 
 - 多网络接口发现与分类（以太网 / Wi-Fi / 移动数据 / 虚拟设备）
 - 实时接口健康检测（内核 flags + carrier，兼容 operstate 为 unknown 的 USB 网卡）
 - 流级调度（五元组哈希、加权轮询、最小负载），连接优先级与权重可配置
+- **用户态 NAT 数据面**：TUN 读包 → 按策略选口 → 源地址重写 → raw socket 出口；AF_PACKET 捕获回程 → 反 NAT 写回 TUN（双向真实转发，独立后台线程）
 - 每接口实时 TX/RX 吞吐统计（读取 `/sys/class/net`，Linux 原生数据源）
 - 直观的 GPUI 界面：侧边栏导航（仪表盘、接口监控、策略配置、性能统计）
 - 现代化暗色/亮色主题，支持「跟随系统」，所有配色集中管理
 - 响应式布局：窄窗口自动折叠侧边栏为横向导航，卡片自适应换行
 - 弹簧动画：卡片入场淡入、进度条平滑追踪、悬停反馈
 - **模拟演示模式**：无需 root 即可展示负载均衡/故障转移调度
-- **真实隧道模式**（`--tun`）：读取真实内核路由进 TUN 的报文并调度
+- **真实隧道模式**（`--tun`）：双向转发真实流量，多连接聚合可达多链路带宽之和
 - 完善的错误处理与日志记录（tracing，文件 + 标准输出）
 
 ## 架构
@@ -35,7 +36,9 @@ netmux/                          # Cargo workspace
 │   │   ├── src/policy.rs        # 聚合策略与调度算法
 │   │   ├── src/aggregator.rs    # 聚合器：路由决策 + 流表 + 模拟流量生成
 │   │   ├── src/tun.rs           # Linux TUN 虚拟设备（ioctl，无外部依赖）
-│   │   ├── src/packet.rs        # IP 报文解析与五元组提取
+│   │   ├── src/packet.rs        # IP 报文解析、校验和与 NAT 地址重写
+│   │   ├── src/egress.rs        # raw socket 出口（SO_BINDTODEVICE）与 AF_PACKET 回程捕获
+│   │   ├── src/nat.rs           # 用户态 NAT 会话表（出站注册 / 回程反查）
 │   │   ├── src/stats.rs         # 吞吐统计采集器
 │   │   ├── src/logging.rs       # 日志初始化
 │   │   └── src/error.rs         # 统一错误类型
@@ -123,7 +126,9 @@ cargo test
 
 ## 已知限制（MVP）
 
-- 报文出口转发（从物理接口发出）尚未实现，调度决策与统计已完整
+- 流级聚合：单条连接的吞吐受单接口上限约束，需多连接并行才能叠加带宽
+- 真实隧道模式需要 `CAP_NET_ADMIN + CAP_NET_RAW`，并建议对出口接口 `INPUT DROP` 以抑制内核 RST 干扰回程捕获
+- 仅支持 IPv4 NAT（IPv6 报文不转发）
 - 故障转移依赖接口健康状态轮询（默认 5s）
 - 仅支持 Linux（遵循 Linux 网络管理规范，读取 `/sys/class/net`、ioctl TUN）
 

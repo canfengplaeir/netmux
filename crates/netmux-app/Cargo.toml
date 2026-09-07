@@ -16,3 +16,4 @@ tracing-subscriber.workspace = true
 log.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+if-addrs.workspace = true
